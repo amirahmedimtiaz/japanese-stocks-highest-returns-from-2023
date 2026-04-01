@@ -1,0 +1,31 @@
+name: Daily Japan Stock Report
+
+on:
+  schedule:
+    # 23:00 UTC is 08:00 AM JST
+    - cron: '0 23 * * *'
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  run-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas yfinance requests openpyxl curl_cffi python-dotenv
+
+      - name: Run analysis
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+        run: python highest_returns_since_2023.py
