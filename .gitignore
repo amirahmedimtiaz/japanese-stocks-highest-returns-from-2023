@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.csv
+debug_years.py
+test_yf.py
