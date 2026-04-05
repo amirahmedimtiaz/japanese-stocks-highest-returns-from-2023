@@ -23,6 +23,20 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Suppress yfinance's noisy "possibly delisted / no price data" ERROR lines.
+# These fire for hundreds of tickers (ETFs, REITs, odd lot shares, genuinely
+# delisted stocks) and are already handled gracefully by skipping empty results.
+# CRITICAL means only genuine crashes still surface from the yfinance logger.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+
+# ── yfinance cache location ────────────────────────────────────────────────────
+# Redirect away from the default ~/.cache/py-yfinance which can collide with
+# runner environments that pre-create that path as a plain file instead of a dir.
+YF_CACHE_DIR = os.path.join("cache", "yfinance")
+os.makedirs(YF_CACHE_DIR, exist_ok=True)
+yf.set_tz_cache_location(YF_CACHE_DIR)
+
 
 # ── Global Session for Browser Impersonation ───────────────────────────────────
 # Used ONLY for direct HTTP requests (e.g. JPX download), NOT passed to yfinance.
@@ -129,14 +143,17 @@ def _is_rate_limit(exc: Exception) -> bool:
     return any(kw in str(exc).lower() for kw in _RL_KEYWORDS)
 
 
-# ── yf.download wrapper ────────────────────────────────────────────────────────
-def yf_download_with_retry(tickers, max_non_rl_attempts=3, **kwargs):
-    """
-    Wraps yf.download() with tiered, tracker-aware retry logic.
-    Never passes a custom session to yfinance.
+# ── Sequential per-ticker history fetcher ─────────────────────────────────────
+# Bulk yf.download() and concurrent fetching both triggered Yahoo IP blocks,
+# returning empty data for every single ticker. Sequential fetching with a
+# small delay between calls mimics organic browser traffic and avoids this.
+# The cache means this slow path only runs once per ticker across all future runs.
 
-    - Rate-limit errors: defer to RequestTracker.compute_wait().
-    - Other errors: up to max_non_rl_attempts then give up.
+def fetch_price_sequential(ticker: str, delay: float = 0.5, **history_kwargs) -> pd.DataFrame:
+    """
+    Fetch price history for a single ticker via t.history().
+    Retries on rate-limit errors using the shared RequestTracker.
+    Returns an empty DataFrame for genuinely delisted / no-data tickers.
     """
     consecutive_429s = 0
     non_rl_attempts  = 0
@@ -144,22 +161,21 @@ def yf_download_with_retry(tickers, max_non_rl_attempts=3, **kwargs):
     while True:
         TRACKER.record()
         try:
-            data = yf.download(tickers, progress=False, **kwargs)
-            consecutive_429s = 0   # reset on success
-            return data
+            t = yf.Ticker(ticker)
+            df = t.history(**history_kwargs)
+            time.sleep(delay)   # courtesy pause after every successful fetch
+            return df
 
         except Exception as e:
             if _is_rate_limit(e):
                 consecutive_429s += 1
                 wait = TRACKER.compute_wait(consecutive_429s)
                 if wait is None:
-                    return pd.DataFrame()   # give up — tracker said so
+                    return pd.DataFrame()
                 time.sleep(wait)
-
             else:
                 non_rl_attempts += 1
-                log.error("yf.download non-rate-limit error (attempt %d): %s", non_rl_attempts, e)
-                if non_rl_attempts >= max_non_rl_attempts:
+                if non_rl_attempts >= 3:
                     return pd.DataFrame()
                 time.sleep(5)
 
@@ -282,77 +298,97 @@ def get_jpx_tickers() -> list[tuple[str, str, str]]:
         return []
 
 
-# ── Step 2: Optimized Analysis ───────────────────────────────────────────────
+# ── Sequential price fetcher ───────────────────────────────────────────────────
+def fetch_price_sequential(ticker: str, delay: float = 0.5, **history_kwargs) -> pd.DataFrame:
+    """
+    Fetch price history for a single ticker using t.history().
+    Retries on rate-limit errors using the shared RequestTracker.
+    Returns an empty DataFrame if the ticker has no data (delisted, etc.).
+
+    Sequential one-at-a-time fetching is intentional — bulk downloads
+    triggered IP blocks from Yahoo. A small delay between calls mimics
+    organic browser traffic and avoids that entirely.
+    """
+    consecutive_429s = 0
+    non_rl_attempts  = 0
+
+    while True:
+        TRACKER.record()
+        try:
+            t = yf.Ticker(ticker)
+            df = t.history(**history_kwargs)
+            # Courtesy pause after every successful fetch — keeps request rate
+            # low enough that Yahoo doesn't see it as a scraping pattern.
+            time.sleep(delay)
+            return df  # may be empty for genuinely delisted tickers — that's fine
+
+        except Exception as e:
+            if _is_rate_limit(e):
+                consecutive_429s += 1
+                wait = TRACKER.compute_wait(consecutive_429s)
+                if wait is None:
+                    return pd.DataFrame()
+                time.sleep(wait)
+            else:
+                non_rl_attempts += 1
+                if non_rl_attempts >= 3:
+                    return pd.DataFrame()
+                time.sleep(5)
+
+
+# ── Step 2: Sequential Market Analysis ────────────────────────────────────────
 def analyze_market(ticker_info: list[tuple[str, str, str]]):
     """
-    Optimized analysis using caching and high-volume bulk downloads.
-    yfinance calls use dynamic retry; no custom session is passed.
+    Fetches prices one ticker at a time using t.history().
+    Bulk yf.download() was replaced because sending 250 tickers per request
+    triggered Yahoo IP blocks, returning empty results for every single stock.
+    Sequential fetching with a small delay looks like organic browser traffic.
+    Aggressive caching means slow fetching only happens once per ticker.
     """
     start_cache = load_cache(PRICE_CACHE_FILE)
     all_tickers = [t[0] for t in ticker_info]
     ticker_map = {t[0]: (t[1], t[2]) for t in ticker_info}
 
-    # 1. Identify which tickers need historical start prices
+    # 1. Fetch historical start prices for tickers not already cached
     missing_start = [t for t in all_tickers if t not in start_cache]
-
     if missing_start:
-        log.info("Fetching start prices for %d new stocks...", len(missing_start))
-        chunk_size = 250
-        total_chunks = (len(missing_start) + chunk_size - 1) // chunk_size
-        for i in range(0, len(missing_start), chunk_size):
-            chunk = missing_start[i : i + chunk_size]
-            log.info(
-                "  Processing Start Price chunk %d/%d...",
-                (i // chunk_size) + 1, total_chunks,
-            )
-            # ── FIX: no session= passed; retry handled internally ──────────
-            data = yf_download_with_retry(
-                chunk,
+        log.info("Fetching start prices for %d new stocks (sequential)...", len(missing_start))
+        for i, ticker in enumerate(missing_start, 1):
+            if i % 100 == 0:
+                log.info("  Start price progress: %d/%d", i, len(missing_start))
+            df = fetch_price_sequential(
+                ticker,
+                delay=0.5,
                 start=START_DATE,
                 end="2023-01-15",
-                group_by="ticker",
             )
-            if data.empty:
+            if df.empty:
                 continue
-            for ticker in chunk:
-                try:
-                    t_df = data[ticker] if isinstance(data.columns, pd.MultiIndex) else data
-                    hist = t_df.dropna(subset=["Close"])
-                    if not hist.empty:
-                        start_cache[ticker] = {
-                            "date": hist.index[0].strftime('%Y-%m-%d'),
-                            "price": float(hist["Close"].iloc[0])
-                        }
-                except Exception:
-                    continue
+            hist = df.dropna(subset=["Close"])
+            if not hist.empty:
+                start_cache[ticker] = {
+                    "date": hist.index[0].strftime('%Y-%m-%d'),
+                    "price": float(hist["Close"].iloc[0])
+                }
         save_cache(PRICE_CACHE_FILE, start_cache)
+        log.info("Start prices cached for %d stocks.", len(start_cache))
 
-    # 2. Bulk fetch latest prices for ALL stocks
-    log.info("Fetching latest prices for %d stocks...", len(all_tickers))
+    # 2. Fetch latest prices for ALL stocks
+    log.info("Fetching latest prices for %d stocks (sequential)...", len(all_tickers))
     latest_prices = {}
-    chunk_size = 250
-    total_chunks = (len(all_tickers) + chunk_size - 1) // chunk_size
-    for i in range(0, len(all_tickers), chunk_size):
-        chunk = all_tickers[i : i + chunk_size]
-        log.info(
-            "  Processing Latest Price chunk %d/%d...",
-            (i // chunk_size) + 1, total_chunks,
-        )
-        # ── FIX: no session= passed; retry handled internally ─────────────
-        data = yf_download_with_retry(chunk, period="1d", group_by="ticker")
-        if data.empty:
+    for i, ticker in enumerate(all_tickers, 1):
+        if i % 100 == 0:
+            log.info("  Latest price progress: %d/%d", i, len(all_tickers))
+        df = fetch_price_sequential(ticker, delay=0.5, period="1d")
+        if df.empty:
             continue
-        for ticker in chunk:
-            try:
-                t_df = data[ticker] if isinstance(data.columns, pd.MultiIndex) else data
-                hist = t_df.dropna(subset=["Close"])
-                if not hist.empty:
-                    latest_prices[ticker] = {
-                        "date": hist.index[-1].strftime('%Y-%m-%d'),
-                        "price": float(hist["Close"].iloc[-1])
-                    }
-            except Exception:
-                continue
+        hist = df.dropna(subset=["Close"])
+        if not hist.empty:
+            latest_prices[ticker] = {
+                "date": hist.index[-1].strftime('%Y-%m-%d'),
+                "price": float(hist["Close"].iloc[-1])
+            }
+    log.info("Latest prices fetched for %d stocks.", len(latest_prices))
 
     # 3. Calculate returns
     hits = []
