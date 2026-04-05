@@ -6,6 +6,7 @@ import time
 import logging
 import os
 import smtplib
+from collections import deque
 from datetime import datetime
 from curl_cffi import requests as curl_requests
 from email.message import EmailMessage
@@ -22,9 +23,75 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Rate Limiting ─────────────────────────────────────────────────────────────
+class RateLimiter:
+    def __init__(self):
+        # Limits: (count, seconds)
+        self.get_limits = [(60, 60), (360, 3600), (8000, 86400)]
+        self.put_limits = [(30, 60), (100, 3600), (2000, 86400)]
+        self.post_limits = [(30, 60), (75, 3600), (1000, 86400)]
+        
+        self.history = {
+            "GET": deque(),
+            "PUT": deque(),
+            "POST": deque()
+        }
+
+    def _wait_if_needed(self, method: str):
+        method = method.upper()
+        if method not in self.history:
+            return
+
+        limits = {
+            "GET": self.get_limits,
+            "PUT": self.put_limits,
+            "POST": self.post_limits
+        }.get(method, [])
+
+        now = time.time()
+        for limit_count, limit_seconds in limits:
+            # Clean up history for this window
+            while self.history[method] and self.history[method][0] < now - limit_seconds:
+                self.history[method].popleft()
+            
+            if len(self.history[method]) >= limit_count:
+                # Wait until the oldest request in this window expires
+                sleep_time = self.history[method][0] + limit_seconds - now
+                if sleep_time > 0:
+                    log.info("Rate limit approaching for %s (%d requests in %ds). Sleeping %.2fs...", 
+                             method, limit_count, limit_seconds, sleep_time)
+                    time.sleep(sleep_time)
+                    # Re-check all limits after sleeping
+                    return self._wait_if_needed(method)
+
+        self.history[method].append(time.time())
+
+RATE_LIMITER = RateLimiter()
+
+class RateLimitedSession:
+    def __init__(self, session):
+        self._session = session
+    
+    def request(self, method, *args, **kwargs):
+        RATE_LIMITER._wait_if_needed(method)
+        return self._session.request(method, *args, **kwargs)
+    
+    def get(self, *args, **kwargs):
+        return self.request("GET", *args, **kwargs)
+    
+    def post(self, *args, **kwargs):
+        return self.request("POST", *args, **kwargs)
+    
+    def put(self, *args, **kwargs):
+        return self.request("PUT", *args, **kwargs)
+    
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
 # ── Global Session for Browser Impersonation ───────────────────────────────────
 # Using curl_cffi to mimic a real Chrome browser fingerprint.
-SESSION = curl_requests.Session(impersonate="chrome")
+RAW_SESSION = curl_requests.Session(impersonate="chrome")
+SESSION = RateLimitedSession(RAW_SESSION)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 JPX_URL = (
@@ -37,12 +104,39 @@ START_DATE = "2023-01-01"
 # LIMIT: Set to a small number (e.g., 20) for testing; None for full market (~4400)
 LIMIT = None 
 
+import json
+
+# ── Cache Configuration ───────────────────────────────────────────────────────
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+PRICE_CACHE_FILE = os.path.join(CACHE_DIR, "start_prices.json")
+ENRICH_CACHE_FILE = os.path.join(CACHE_DIR, "enrichment.json")
+JPX_CACHE_FILE = os.path.join(CACHE_DIR, "jpx_master.csv")
+
+def load_cache(path):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_cache(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 # ── Step 1: fetch the JPX master list ─────────────────────────────────────────
 def get_jpx_tickers() -> list[tuple[str, str, str]]:
     """Return [(yf_ticker, name, sector), …] for all TSE-listed equities."""
-    log.info("Downloading JPX stock list …")
+    # Cache JPX list for 24 hours
+    if os.path.exists(JPX_CACHE_FILE):
+        mtime = os.path.getmtime(JPX_CACHE_FILE)
+        if (time.time() - mtime) < 86400: # 24 hours
+            log.info("Loading JPX stock list from cache...")
+            df = pd.read_csv(JPX_CACHE_FILE)
+            return list(zip(df['Ticker'], df['Name'], df['Sector']))
+
+    log.info("Downloading JPX stock list from JPX website...")
     try:
-        resp = requests.get(JPX_URL, timeout=30)
+        resp = SESSION.get(JPX_URL, timeout=30)
         resp.raise_for_status()
         df = pd.read_excel(io.BytesIO(resp.content))
 
@@ -51,184 +145,186 @@ def get_jpx_tickers() -> list[tuple[str, str, str]]:
         sector_col = next((c for c in df.columns if "33 Sector(name)" in str(c)), "Sector")
 
         tickers = df[code_col].astype(str).str.strip()
-        names   = df[name_col].tolist()
-        sectors = df[sector_col].tolist()
-
         yf_tickers = [f"{t}.T" if len(t) >= 4 else t for t in tickers]
-        return list(zip(yf_tickers, names, sectors))
+        
+        result_df = pd.DataFrame({
+            'Ticker': yf_tickers,
+            'Name': df[name_col].tolist(),
+            'Sector': df[sector_col].tolist()
+        })
+        result_df.to_csv(JPX_CACHE_FILE, index=False)
+        
+        return list(zip(result_df['Ticker'], result_df['Name'], result_df['Sector']))
     except Exception as exc:
         log.error("Failed to fetch JPX list: %s", exc)
         return []
 
-# ── Step 2: Sequential Analysis ───────────────────────────────────────────────
+# ── Step 2: Optimized Analysis ───────────────────────────────────────────────
 def analyze_market(ticker_info: list[tuple[str, str, str]]):
     """
-    Processes each stock sequentially to calculate returns since 2023-01-01.
+    Optimized analysis using caching and high-volume bulk downloads.
     """
-    hits = []
-    total = len(ticker_info)
+    start_cache = load_cache(PRICE_CACHE_FILE)
+    all_tickers = [t[0] for t in ticker_info]
+    ticker_map = {t[0]: (t[1], t[2]) for t in ticker_info}
     
-    log.info("Starting sequential analysis of %d stocks...", total)
+    # 1. Identify which tickers need historical start prices
+    missing_start = [t for t in all_tickers if t not in start_cache]
     
-    for i, (ticker, name, sector) in enumerate(ticker_info, 1):
-        log.info("Checking %d/%d: %s (%s)", i, total, ticker, name)
-        attempts = 0
-        max_attempts = 3
-        
-        while attempts < max_attempts:
+    if missing_start:
+        log.info("Fetching start prices for %d new stocks...", len(missing_start))
+        # Larger chunks (250) to minimize GET requests
+        chunk_size = 250
+        for i in range(0, len(missing_start), chunk_size):
+            chunk = missing_start[i : i + chunk_size]
+            log.info("  Processing Start Price chunk %d/%d...", (i//chunk_size)+1, (len(missing_start)//chunk_size)+1)
             try:
-                t_obj = yf.Ticker(ticker, session=SESSION)
-                hist = t_obj.history(start=START_DATE, interval="1d")
-                
-                if hist.empty:
-                    attempts += 1
-                    if attempts < max_attempts:
-                        wait = attempts * 60
-                        log.warning("Empty data/Limit for %s. Waiting %ds (Attempt %d/%d)...", ticker, wait, attempts, max_attempts)
-                        time.sleep(wait)
-                        continue
-                    else:
-                        break
-
-                if len(hist) < 2:
-                    log.debug("Insufficient data for %s", ticker)
-                    break
-                
-                price_start = float(hist["Close"].iloc[0])
-                price_end = float(hist["Close"].iloc[-1])
-                
-                if price_start > 0:
-                    return_pct = ((price_end - price_start) / price_start) * 100
-                    
-                    # Calculate CAGR
-                    # hist.index[0] is the date of the first price in 2023
-                    # hist.index[-1] is the date of the latest price
-                    days = (hist.index[-1] - hist.index[0]).days
-                    years = days / 365.25
-                    if years > 0:
-                        cagr = (pow(price_end / price_start, 1 / years) - 1) * 100
-                    else:
-                        cagr = return_pct # Fallback if same day
-                        
-                    hits.append({
-                        "Ticker": ticker, 
-                        "Name": name, 
-                        "Sector": sector,
-                        "First Trading Date": hist.index[0].strftime('%Y-%m-%d'),
-                        "Start Price (2023)": round(price_start, 2),
-                        "Latest Price": round(price_end, 2),
-                        "Return %": round(return_pct, 2),
-                        "CAGR %": round(cagr, 2)
-                    })
-                
-                break # Success!
-                
+                data = yf.download(chunk, start=START_DATE, end="2023-01-15", session=SESSION, group_by="ticker", progress=False)
+                for ticker in chunk:
+                    try:
+                        t_df = data[ticker] if len(chunk) > 1 else data
+                        hist = t_df.dropna(subset=["Close"])
+                        if not hist.empty:
+                            start_cache[ticker] = {
+                                "date": hist.index[0].strftime('%Y-%m-%d'),
+                                "price": float(hist["Close"].iloc[0])
+                            }
+                    except Exception: continue
             except Exception as e:
-                if "Rate Limit" in str(e) or "429" in str(e):
-                    attempts += 1
-                    wait = attempts * 60
-                    log.warning("Rate limit hit for %s. Waiting %ds (Attempt %d/%d)...", ticker, wait, attempts, max_attempts)
-                    time.sleep(wait)
-                else:
-                    log.error("Error processing %s: %s", ticker, e)
-                    break
-    
+                log.error("Bulk start price error: %s", e)
+        save_cache(PRICE_CACHE_FILE, start_cache)
+
+    # 2. Bulk fetch latest prices for ALL stocks
+    log.info("Fetching latest prices for %d stocks...", len(all_tickers))
+    latest_prices = {}
+    chunk_size = 250 # High density chunking
+    for i in range(0, len(all_tickers), chunk_size):
+        chunk = all_tickers[i : i + chunk_size]
+        log.info("  Processing Latest Price chunk %d/%d...", (i//chunk_size)+1, (len(all_tickers)//chunk_size)+1)
+        try:
+            data = yf.download(chunk, period="1d", session=SESSION, group_by="ticker", progress=False)
+            for ticker in chunk:
+                try:
+                    t_df = data[ticker] if len(chunk) > 1 else data
+                    hist = t_df.dropna(subset=["Close"])
+                    if not hist.empty:
+                        latest_prices[ticker] = {
+                            "date": hist.index[-1].strftime('%Y-%m-%d'),
+                            "price": float(hist["Close"].iloc[-1])
+                        }
+                except Exception: continue
+        except Exception as e:
+            log.error("Bulk latest price error: %s", e)
+
+    # 3. Calculate returns
+    hits = []
+    for ticker in all_tickers:
+        if ticker in start_cache and ticker in latest_prices:
+            s_data = start_cache[ticker]
+            l_data = latest_prices[ticker]
+            
+            p_start = s_data["price"]
+            p_end = l_data["price"]
+            
+            if p_start > 0:
+                return_pct = ((p_end - p_start) / p_start) * 100
+                
+                # CAGR calculation
+                d_start = datetime.strptime(s_data["date"], '%Y-%m-%d')
+                d_end = datetime.strptime(l_data["date"], '%Y-%m-%d')
+                days = (d_end - d_start).days
+                years = days / 365.25
+                cagr = (pow(p_end / p_start, 1 / years) - 1) * 100 if years > 0 else return_pct
+                
+                name, sector = ticker_map[ticker]
+                hits.append({
+                    "Ticker": ticker, 
+                    "Name": name, 
+                    "Sector": sector,
+                    "First Trading Date": s_data["date"],
+                    "Start Price (2023)": round(p_start, 2),
+                    "Latest Price": round(p_end, 2),
+                    "Return %": round(return_pct, 2),
+                    "CAGR %": round(cagr, 2)
+                })
+
     return hits
 
 def enrich_data(hits):
     """
-    Fetches financials and business summary for the provided hits.
+    Enriches with 2022 financials, utilizing cache for static data.
     """
+    enrich_cache = load_cache(ENRICH_CACHE_FILE)
     enriched = []
     total = len(hits)
-    log.info("Enriching %d top performers with financials and summaries...", total)
     
+    log.info("Enriching %d top performers with 2022 data...", total)
     for i, hit in enumerate(hits, 1):
         ticker = hit["Ticker"]
-        log.info("[%d/%d] Fetching details for %s", i, total, ticker)
         
+        if ticker in enrich_cache:
+            hit.update(enrich_cache[ticker])
+            enriched.append(hit)
+            continue
+
+        log.info("[%d/%d] Fetching NEW 2022 details for %s", i, total, ticker)
         try:
             t_obj = yf.Ticker(ticker, session=SESSION)
             
-            # 1. Business Summary
-            info = t_obj.info
-            hit["Summary"] = info.get("longBusinessSummary", "N/A")
+            data_to_cache = {}
             
-            # 2. Financials
             fin = t_obj.financials
             bs = t_obj.balance_sheet
-            
-            # Helper to find the column for a specific year
+
             def get_year_col(df, year):
                 if df is None or df.empty: return None
-                # Look for a column that has the year in its name
                 for col in df.columns:
-                    if str(year) in str(col):
-                        return col
+                    if str(year) in str(col): return col
                 return None
 
-            # Calculate ROE for 2020, 2021, 2022
-            for year in [2020, 2021, 2022]:
-                hit[f"ROE ({year}) %"] = "N/A"
-                col_fin = get_year_col(fin, year)
-                col_bs = get_year_col(bs, year)
-                
-                if col_fin is not None and col_bs is not None:
-                    net_income = fin.loc["Net Income", col_fin] if "Net Income" in fin.index else None
-                    equity = None
-                    if "Stockholders Equity" in bs.index:
-                        equity = bs.loc["Stockholders Equity", col_bs]
-                    elif "Common Stock Equity" in bs.index:
-                        equity = bs.loc["Common Stock Equity", col_bs]
-                    
-                    if net_income and equity and equity != 0:
-                        roe = (net_income / equity) * 100
-                        hit[f"ROE ({year}) %"] = round(roe, 2)
+            c_22_f = get_year_col(fin, 2022)
+            c_22_b = get_year_col(bs, 2022)
+            
+            # 1. ROE (2022)
+            data_to_cache["ROE (2022) %"] = "N/A"
+            if c_22_f is not None and c_22_b is not None:
+                net = fin.loc["Net Income", c_22_f] if "Net Income" in fin.index else None
+                eq = None
+                if "Stockholders Equity" in bs.index: eq = bs.loc["Stockholders Equity", c_22_b]
+                elif "Common Stock Equity" in bs.index: eq = bs.loc["Common Stock Equity", c_22_b]
+                if net and eq: data_to_cache["ROE (2022) %"] = round((net/eq)*100, 2)
 
-            # Specific 2022-based metrics
-            col_2022_fin = get_year_col(fin, 2022)
-            col_2022_bs = get_year_col(bs, 2022)
+            # 2. P/E and Equity Ratio (2022)
+            data_to_cache["P/E (2022 Earnings/2023 Price)"] = "N/A"
+            data_to_cache["Equity Ratio (2022) %"] = "N/A"
             
-            hit["P/E (2022 Earnings/2023 Price)"] = "N/A"
-            hit["Equity Ratio (2022) %"] = "N/A"
-            
-            if col_2022_fin is not None:
-                # EPS for P/E calculation
-                eps = None
-                if "Diluted EPS" in fin.index:
-                    eps = fin.loc["Diluted EPS", col_2022_fin]
-                elif "Basic EPS" in fin.index:
-                    eps = fin.loc["Basic EPS", col_2022_fin]
-                
+            if c_22_f is not None:
+                eps = fin.loc["Diluted EPS", c_22_f] if "Diluted EPS" in fin.index else fin.get("Basic EPS", {}).get(c_22_f)
                 if eps and eps > 0:
-                    pe = hit["Start Price (2023)"] / eps
-                    hit["P/E (2022 Earnings/2023 Price)"] = round(pe, 2)
+                    data_to_cache["P/E (2022 Earnings/2023 Price)"] = round(hit["Start Price (2023)"] / eps, 2)
                 
-                # Equity Ratio needs Balance Sheet
-                if col_2022_bs is not None:
-                    total_assets = bs.loc["Total Assets", col_2022_bs] if "Total Assets" in bs.index else None
-                    equity = None
-                    if "Stockholders Equity" in bs.index:
-                        equity = bs.loc["Stockholders Equity", col_2022_bs]
-                    elif "Common Stock Equity" in bs.index:
-                        equity = bs.loc["Common Stock Equity", col_2022_bs]
-                    
-                    if total_assets and equity:
-                        equity_ratio = (equity / total_assets) * 100
-                        hit["Equity Ratio (2022) %"] = round(equity_ratio, 2)
+                if c_22_b is not None:
+                    ast = bs.loc["Total Assets", c_22_b] if "Total Assets" in bs.index else None
+                    eq = None
+                    if "Stockholders Equity" in bs.index: eq = bs.loc["Stockholders Equity", c_22_b]
+                    elif "Common Stock Equity" in bs.index: eq = bs.loc["Common Stock Equity", c_22_b]
+                    if ast and eq: data_to_cache["Equity Ratio (2022) %"] = round((eq/ast)*100, 2)
 
+            enrich_cache[ticker] = data_to_cache
+            hit.update(data_to_cache)
+            
         except Exception as e:
             log.warning("Could not enrich %s: %s", ticker, e)
-            # Ensure keys exist even on failure
-            hit.setdefault("Summary", "N/A")
-            for year in [2020, 2021, 2022]:
-                hit.setdefault(f"ROE ({year}) %", "N/A")
-            hit.setdefault("P/E (2022 Earnings/2023 Price)", "N/A")
-            hit.setdefault("Equity Ratio (2022) %", "N/A")
-            
+            hit.update({
+                "ROE (2022) %": "N/A",
+                "P/E (2022 Earnings/2023 Price)": "N/A", 
+                "Equity Ratio (2022) %": "N/A"
+            })
+
         enriched.append(hit)
-        time.sleep(1) # Small delay to be polite
+        time.sleep(0.5)
         
+    save_cache(ENRICH_CACHE_FILE, enrich_cache)
     return enriched
 
 def send_email(file_path, total_hits):
