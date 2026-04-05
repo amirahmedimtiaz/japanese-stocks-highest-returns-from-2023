@@ -67,31 +67,15 @@ class RateLimiter:
         self.history[method].append(time.time())
 
 RATE_LIMITER = RateLimiter()
-
-class RateLimitedSession:
-    def __init__(self, session):
-        self._session = session
-    
+class RateLimitedSession(curl_requests.Session):
     def request(self, method, *args, **kwargs):
         RATE_LIMITER._wait_if_needed(method)
-        return self._session.request(method, *args, **kwargs)
-    
-    def get(self, *args, **kwargs):
-        return self.request("GET", *args, **kwargs)
-    
-    def post(self, *args, **kwargs):
-        return self.request("POST", *args, **kwargs)
-    
-    def put(self, *args, **kwargs):
-        return self.request("PUT", *args, **kwargs)
-    
-    def __getattr__(self, name):
-        return getattr(self._session, name)
+        return super().request(method, *args, **kwargs)
 
 # ── Global Session for Browser Impersonation ───────────────────────────────────
 # Using curl_cffi to mimic a real Chrome browser fingerprint.
-RAW_SESSION = curl_requests.Session(impersonate="chrome")
-SESSION = RateLimitedSession(RAW_SESSION)
+SESSION = RateLimitedSession(impersonate="chrome")
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 JPX_URL = (
@@ -182,7 +166,8 @@ def analyze_market(ticker_info: list[tuple[str, str, str]]):
                 data = yf.download(chunk, start=START_DATE, end="2023-01-15", session=SESSION, group_by="ticker", progress=False)
                 for ticker in chunk:
                     try:
-                        t_df = data[ticker] if len(chunk) > 1 else data
+                        # yfinance behaves differently for single vs multiple tickers
+                        t_df = data[ticker] if isinstance(data.columns, pd.MultiIndex) else data
                         hist = t_df.dropna(subset=["Close"])
                         if not hist.empty:
                             start_cache[ticker] = {
@@ -205,7 +190,8 @@ def analyze_market(ticker_info: list[tuple[str, str, str]]):
             data = yf.download(chunk, period="1d", session=SESSION, group_by="ticker", progress=False)
             for ticker in chunk:
                 try:
-                    t_df = data[ticker] if len(chunk) > 1 else data
+                    # yfinance behaves differently for single vs multiple tickers
+                    t_df = data[ticker] if isinstance(data.columns, pd.MultiIndex) else data
                     hist = t_df.dropna(subset=["Close"])
                     if not hist.empty:
                         latest_prices[ticker] = {
